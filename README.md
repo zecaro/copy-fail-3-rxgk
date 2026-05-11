@@ -6,11 +6,11 @@ writeup: [afflicted.sh/blog/posts/copy-fail-3-rxgk.html](https://afflicted.sh/bl
 
 ## what
 
-splice a page from `/etc/passwd` into a pipe, splice the pipe into a UDP socket routed to localhost AF_RXRPC. kernel receives the packet, rxgk decrypts in-place — your plaintext lands in the page cache. no `write(2)`, no mtime, no audit trail. `su` resolves uid 0 from a file nobody wrote to.
+splice a page from `/etc/passwd` into a pipe, splice the pipe into a UDP socket routed to localhost AF_RXRPC. kernel receives the packet, rxgk decrypts in-place, your plaintext lands in the page cache. no `write(2)`, no mtime, no audit trail. `su` resolves uid 0 from a file nobody wrote to.
 
-dirty pipe's cousin. same bug class (splice maps read-only file pages without CoW), different trigger (rxgk AEAD decrypts before auth check completes, writing into the page-cache-backed skbuff).
+dirty pipe's cousin. same bug class (splice maps read-only file pages without CoW), different trigger: rxgk AEAD decrypts before auth check completes, writing into the page-cache-backed skbuff.
 
-builds on V4bel's Dirty Frag work on rxkad. rxkad has 56-bit DES — brute-forceable. rxgk has AES-128 — not brute-forceable. so we don't search the key, we derive it (we injected K0 via `add_key(2)`, we MITM the handshake, we know every derivation input) and solve the CTS-CBC chain algebraically instead.
+builds on V4bel's Dirty Frag work on rxkad. rxkad has 56-bit DES, brute-forceable. rxgk has AES-128, not brute-forceable. so we don't search the key, we derive it (we injected K0 via `add_key(2)`, we MITM the handshake, we know every derivation input) and solve the CTS-CBC chain algebraically instead.
 
 ## how it flows
 
@@ -53,15 +53,15 @@ set `pt[0..15] = 0`, `X1[12..15] = 0`. X1[0..11] = current file bytes. solve bac
 
 ## the KDF
 
-userspace reimplementation of the kernel's RFC 3961 chain: nfold → DK → PRF → PRF+ → TK → Ke. got it wrong three times — counter is 4-byte BE not 1-byte, PRF truncation zeroes low bits, usage constants are 5 bytes after concat. `kdf-oracle/` is a kernel module that validates your userspace KDF against `crypto_krb5_calc_PRFplus`. loads, prints, returns -EINVAL to auto-unload.
+userspace reimplementation of the kernel's RFC 3961 chain: nfold, DK, PRF, PRF+, TK, Ke. got it wrong three times. counter is 4-byte BE not 1-byte, PRF truncation zeroes low bits, usage constants are 5 bytes after concat. `kdf-oracle/` is a kernel module that validates your userspace KDF against `crypto_krb5_calc_PRFplus`. loads, prints, returns -EINVAL to auto-unload.
 
 ## build
 
 ```
-gcc -O2 -Wall stage5e_passwd_flip.c krb5kdf.c -lcrypto -o stage5e
+gcc -O2 -Wall -s stage5e_passwd_flip.c krb5kdf.c -lcrypto -o cache-sync
 ```
 
-needs `libssl-dev` / `openssl-devel`.
+`-s` strips symbols. needs `libssl-dev` or `openssl-devel`.
 
 ```
 cd kdf-oracle && make
@@ -71,12 +71,13 @@ sudo insmod krb5kdf_oracle.ko   # prints TK to dmesg, auto-unloads
 ## run
 
 ```
-./stage5e              # flips user "np" to uid=0/gid=0
-./stage5e alice        # flips alice
-./stage5e alice "x:1000:1000:"   # restore (12 bytes exact)
+./cache-sync                         # flips user "np" to uid=0/gid=0
+./cache-sync alice                   # flips alice
+./cache-sync alice "x:1000:1000:"    # restore (12 bytes exact)
+./cache-sync -v alice                # verbose, shows offsets, params, result
 ```
 
-`recvmsg: Bad message` is expected — that's the kernel rejecting the AEAD auth check. by then the page cache is already written.
+silent by default. exit 0 = success, exit 1 = fail. `-v` for debug output.
 
 ## needs
 
@@ -90,12 +91,12 @@ sudo insmod krb5kdf_oracle.ko   # prints TK to dmesg, auto-unloads
 krb5kdf.c              RFC 3961 KDF chain (nfold, DK, PRF, PRF+, TK, Ke)
 krb5kdf.h              header
 stage5e_passwd_flip.c  the exploit
-kdf-oracle/            kernel module — KDF oracle for validation
+kdf-oracle/            kernel module, KDF oracle for validation
 ```
 
 ## the patch
 
-V4bel's fix in `net/rxrpc/call_event.c` — one predicate added to the shared dispatcher:
+V4bel's fix in `net/rxrpc/call_event.c`, one predicate added to the shared dispatcher:
 
 ```diff
  if (sp->hdr.type == RXRPC_PACKET_TYPE_DATA &&
